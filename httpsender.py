@@ -21,6 +21,8 @@ import aiofiles
 import copy
 import os
 from hashlib import sha256, sha1, md5
+import re
+import aiodns
 
 
 
@@ -33,6 +35,36 @@ from typing import (Any,
                     BinaryIO,
                     TextIO,
                     )
+
+def check_domain(value) -> bool:
+    """
+        Validating Domain Names
+    :param value: string with domain, hostname
+    :return: bool
+    """
+
+    def to_unicode(obj, charset='utf-8', errors='strict'):
+        if obj is None:
+            return None
+        if not isinstance(obj, bytes):
+            return str(obj)
+        return obj.decode(charset, errors)
+
+    pattern = re.compile(
+        r'^(([a-zA-Z]{1})|([a-zA-Z]{1}[a-zA-Z]{1})|'
+        r'([a-zA-Z]{1}[0-9]{1})|([0-9]{1}[a-zA-Z]{1})|'
+        r'([a-zA-Z0-9][-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9]))\.'
+        r'([a-zA-Z]{2,13}|[a-zA-Z0-9-]{2,30}.[a-zA-Z]{2,3})$'
+    )
+
+    try:
+        result = pattern.match(to_unicode(value).encode('idna').decode('ascii'))
+        if result:
+            return True
+        else:
+            return False
+    except (UnicodeError, AttributeError):
+        return False
 
 
 def dict_paths(some_dict: dict,
@@ -270,7 +302,8 @@ def check_network(net_str: str) -> bool:
 
 
 def create_target_http_protocol(hostname: str,
-                                   settings: dict) -> Generator[NamedTuple, None, None]:
+                                settings: dict,
+                                domain: bool = False) -> Generator[NamedTuple, None, None]:
     """
     На основании ip адреса и настроек возвращает через yield
     экзэмпляр namedtuple - Target.
@@ -296,18 +329,25 @@ def create_target_http_protocol(hostname: str,
     if current_settings['max_size'] != -1:
         current_settings['max_size'] = current_settings['max_size']*1024
 
-
+    # data.http.result.response.request.url.scheme
     if current_settings['sslcheck']:
         _url = f"https://{hostname}:{str(current_settings['port'])}{current_settings['endpoint']}"
+        current_settings['scheme'] = 'https'
     else:
         _url = f"http://{hostname}:{str(current_settings['port'])}{current_settings['endpoint']}"
+        current_settings['scheme'] = 'http'
     current_settings['url'] = _url
+    current_settings['status_domain'] = domain
+    if not domain:
+        current_settings['ip'] = hostname
+        current_settings['fqdn'] = ''
+    else:
+        current_settings['ip'] = ''
+        current_settings['fqdn'] = hostname
 
     key_names = list(current_settings.keys())
-    key_names.extend(['ip', 'payload'])
+    key_names.extend(['payload'])
     Target = namedtuple('Target', key_names)
-
-    current_settings['ip'] = hostname # TODO: переделать, в таком варианте только ip
     if payloads:
         for payload in payloads:
             tmp_settings = copy.copy(current_settings)
@@ -321,14 +361,20 @@ def create_target_http_protocol(hostname: str,
 
 
 def create_targets_http_protocol(ip_str: str,
-                                 settings: dict) -> NamedTuple:
-    hosts = ip_network(ip_str, strict=False)
+                                 settings: dict,
+                                 domain: bool = False) -> NamedTuple:
+    if not domain:
+        hosts = ip_network(ip_str, strict=False)
+    else:
+        hosts = [ip_str]
+
     for host in hosts:
-        for target in create_target_http_protocol(str(host), settings):
+        for target in create_target_http_protocol(str(host), settings, domain=domain):
             yield target
 
 
-def create_template_struct() -> dict:
+
+def create_template_struct(target: NamedTuple) -> dict:
     """
     такая структура у результатов в модуле zgrab2 http - поэтому ее так и повторил
     :return:
@@ -339,29 +385,48 @@ def create_template_struct() -> dict:
                        {'status': 'http',
                         'result':
                             {'response':
-                                 {'request':
-                                      {'tls_log':
-                                           {'handshake_log':
-                                                {'server_certificates':
-                                                     {'certificate':{'parsed':{},
-                                                                     'raw':''}}
-                                                 }
-                                            }
-                             }}},
+                                 {'request':{}
+                                      }},
 
                         }
                    }
               }
+    _tls_log = {'tls_log':
+         {'handshake_log':
+              {'server_certificates':
+                   {'certificate': {'parsed': {},
+                                    'raw': ''}}
+               }
+          }
+     }
+    if target.sslcheck:
+        result['data']['http']['result']['response']['request'].update(_tls_log)
+    result['data']['http']['result']['response']['request']['url'] = {}
+    result['data']['http']['result']['response']['request']['url']['scheme'] = target.scheme
+    if len(target.fqdn) > 0:
+        result['data']['http']['result']['response']['request']['url']['host'] = target.fqdn
+        result['host'] = target.fqdn
+        result['data']['http']['result']['response']['request']['host'] = target.fqdn
+    elif len(target.ip) > 0:
+        result['data']['http']['result']['response']['request']['url']['host'] = target.ip
+        result['data']['http']['result']['response']['request']['host'] = target.ip
+    result['data']['http']['result']['response']['request']['url']['path'] = target.endpoint
+    result['data']['http']['result']['response']['request']['method'] = target.method
     return result
 
 
 def create_template_error(target, error_str):
     _tmp = {'ip': target.ip,
             'port': target.port,
-            'data':{}}
+            'host': target.fqdn,
+            'data': {}}
     _tmp["data"]["http"] = {}
     _tmp["data"]["http"]["status"] = "unknown-error"
     _tmp["data"]["http"]["error"] = error_str
+    if not (len(target.fqdn) > 0):
+        _tmp.pop('host')
+    if not (len(target.ip) > 0):
+        _tmp.pop('ip')
     return _tmp
 
 
@@ -416,15 +481,19 @@ def convert_bytes_to_cert(bytes_cert):
         except:
             pass
 
+
+        # region block not used
+        # signature_hash_algorithm = cert.signature_hash_algorithm
+        # subject = cert.subject
+        # not_valid_after = cert.not_valid_after
+        # alg_hash = cert.signature_hash_algorithm
+        # tp = cert.fingerprint(alg_hash)
+        # alg_hash_value = ''.join('{:02x}'.format(x) for x in tp)
+        # endregion
+
         result = dict()
         serial_number = cert.serial_number
-        signature_hash_algorithm = cert.signature_hash_algorithm
-        subject = cert.subject
         issuer = cert.issuer
-        alg_hash = cert.signature_hash_algorithm
-        not_valid_after = cert.not_valid_after
-        tp = cert.fingerprint(alg_hash)
-        alg_hash_value = ''.join('{:02x}'.format(x) for x in tp)
         try:
             result['validity'] = {}
             result['validity']['end_datetime'] = cert.not_valid_after
@@ -433,8 +502,6 @@ def convert_bytes_to_cert(bytes_cert):
             result['validity']['start'] = result['validity']['start_datetime'].strftime('%Y-%m-%dT%H:%M:%SZ')
         except Exception as e:
             pass
-        # result['issuer'] = issuer
-        # result['subject2'] = subject
         result['issuer'] = {}
         dict_replace = {'countryName': 'country',
                         'organizationName': 'organization',
@@ -448,13 +515,6 @@ def convert_bytes_to_cert(bytes_cert):
                     result['issuer'][dict_replace[name_k]] = [value]
         except Exception as e:
             pass
-
-
-            # _issuer[key.lower().replace('-', '_')] = issuer.rdns.getall(key)
-        # print(issuer.get_attributes_for_oid)
-
-        # for key in issuer:
-        #     result['issuer'][key.lower()] = issuer.getall(key)
         try:
             if 'v' in cert.version.name:
                 result['version'] = cert.version.name.split('v')[1].strip()
@@ -549,7 +609,7 @@ async def make_document_from_response(response, target) -> dict:
         # json_record['port'] = int(target.port)
         return json_record
 
-    _default_record = create_template_struct()
+    _default_record = create_template_struct(target)
     if target.sslcheck:
         cert = convert_bytes_to_cert(response.peer_cert)
         _default_record['data']['http']['result']['response']['request']['tls_log']['handshake_log'][
@@ -562,6 +622,7 @@ async def make_document_from_response(response, target) -> dict:
     _default_record['data']['http']['status'] = "success"
     _default_record['data']['http']['result']['response']['status_code'] = response.status
     _header = {}
+
     for key in response.headers:
         _header[key.lower().replace('-', '_')] = response.headers.getall(key)
     _default_record['data']['http']['result']['response']['headers']=_header
@@ -608,10 +669,28 @@ async def make_document_from_response(response, target) -> dict:
 
 
 async def worker_single(target):
+
+    def return_ip_from_deep(sess, response) -> str:
+        try:
+            ip_port = response.connection.transport.get_extra_info('peername')
+            if check_ip(ip_port[0]):
+                return ip_port[0]
+        except:
+            pass
+        try:
+            _tmp_conn_key = sess.connector._conns.items()
+            for k, v in _tmp_conn_key:
+                _h = v[0][0]
+                ip_port = _h.transport.get_extra_info('peername')
+                if check_ip(ip_port[0]):
+                    return ip_port[0]
+        except:
+            pass
+        return ''
+
     result = None
     timeout = ClientTimeout(target.timeout)
     if target.sslcheck:
-        # conn = TCPConnector(verify_ssl=False, limit_per_host=1)
         conn = TCPConnector(ssl=False, limit_per_host=1)
         session = ClientSession(timeout=timeout, connector=conn,  response_class=WrappedResponseClass)
     else:
@@ -631,7 +710,14 @@ async def worker_single(target):
                                    data=target.payload,
                                    timeout=timeout) as response:
             result = await make_document_from_response(response, target)
-
+            # какое-то безумие с функцией return_ip_from_deep, автор aiohttp говорит, что просто так до ip сервера
+            # не добраться
+            # link: https://github.com/aio-libs/aiohttp/issues/4249
+            # но есть моменты....
+            # в функции return_ip_from_deep через какую-то "жопу" добираемся до ip - это не дело, но пока оставим так
+            if len(result['ip']) == 0:
+                _ip = return_ip_from_deep(session, response)
+                result['ip'] = _ip
         await asyncio.sleep(0.05)
         await session.close()
     except Exception as e:
@@ -650,16 +736,44 @@ async def worker_group(block: list):
         tasks.append(task)
     responses = await asyncio.gather(*tasks)  # all response bodies in this variable - responses
     await asyncio.sleep(0.05)
-    async with aiofiles.open('/dev/stdout', mode='wb') as f:
-        for dict_line in responses:
-            success = return_value_from_dict(dict_line, "data.http.status")
-            if success == "success":
-                count_good += 1
-            else:
-                count_error += 1
-            line = ujson.dumps(dict_line)
-            await f.write(line.encode('utf-8'))
-            await f.write(b'\n')
+    if responses:
+        method_write_result = write_to_stdout
+        if mode_write == 'a':
+            method_write_result = write_to_file
+        async with aiofiles.open(output_file, mode=mode_write) as file_with_results:
+            for dict_line in responses:
+                if dict_line:
+                    success = return_value_from_dict(dict_line, "data.http.status")
+                    if success == "success":
+                        count_good += 1
+                    else:
+                        count_error += 1
+                    line = None
+                    try:
+                        if args.show_only_success:
+                            if success == "success":
+                                line = ujson.dumps(dict_line)
+                        else:
+                            line = ujson.dumps(dict_line)
+                    except Exception as e:
+                        pass
+                    if line:
+                        await method_write_result(file_with_results, line)
+
+
+async def write_to_stdout(object_file: BinaryIO,
+                          record_str: str):
+    try:
+        await object_file.write(record_str.encode('utf-8') + b'\n')
+    except Exception as e:
+        pass
+
+async def write_to_file(object_file: TextIO,
+                        record_str: str):
+    try:
+        await object_file.write(record_str + '\n')
+    except Exception as e:
+        pass
 
 
 async def work_with_queue(queue_results, count):
@@ -671,7 +785,6 @@ async def work_with_queue(queue_results, count):
         # wait for an item from the "start_application"
         item = await queue_results.get()
         if item == b"check for end":
-            # the "start_application" send "check for end" to indicate that ZMAP is done
             # TODO send statistics
             break
         if item:
@@ -693,12 +806,15 @@ async def read_input_file(queue_results, settings, path_to_file):
     async with aiofiles.open(path_to_file, mode='rt') as f: # read str
         async for line in f:
             linein = line.strip()
+            targets = None
             if any([check_ip(linein), check_network(linein)]):
                 targets = create_targets_http_protocol(linein, settings)
-                if targets:
-                    for target in targets:
-                        count_input += 1 # statistics
-                        queue_results.put_nowait(target)
+            elif check_domain(linein):
+                targets = create_targets_http_protocol(linein, settings, domain=True)
+            if targets:
+                for target in targets:
+                    count_input += 1 # statistics
+                    queue_results.put_nowait(target)
     queue_results.put_nowait(b"check for end")
 
 
@@ -708,12 +824,15 @@ async def read_input_stdin(queue_results, settings, path_to_file=None):
         try:
             _tmp_input = await ainput()  # read str from stdin
             linein = _tmp_input.strip()
+            targets = None
             if any([check_ip(linein), check_network(linein)]):
                 targets = create_targets_http_protocol(linein, settings)
-                if targets:
-                    for target in targets:
-                        count_input += 1
-                        queue_results.put_nowait(target)
+            elif check_domain(linein):
+                targets = create_targets_http_protocol(linein, settings, domain=True)
+            if targets:
+                for target in targets:
+                    count_input += 1  # statistics
+                    queue_results.put_nowait(target)
         except EOFError:
             queue_results.put_nowait(b"check for end")
             break
@@ -744,16 +863,19 @@ if __name__ == "__main__":
 
     parser.add_argument("-f", "--input-file", dest='input_file', type=str, help="path to file with targets")
 
+    parser.add_argument("-o", "--output-file", dest='output_file', type=str, help="path to file with results")
+
     parser.add_argument("-s", "--senders",  dest='senders', type=int,
-                        default=1024, help=' Number of send coroutines to use (default: 1024)')
+                        default=1024, help='Number of coroutines to use (default: 1024)')
 
     parser.add_argument("--max-size", dest='max_size', type=int,
                         default=256, help='Maximum total kilobytes to read for a single host (default 256)')
 
     parser.add_argument("-t", "--timeout", dest='timeout', type=int,
-                        default=45, help='Set connection timeout (default: 45)')
+                        default=15, help='Set connection timeout (default: 15)')
 
-    parser.add_argument("-p", "--port", type=int, default=80, help='Specify port (default: 80)')
+    parser.add_argument("-p", "--port", type=int, default=80, help='Specify port (default: 80) '
+                                                                   'or ports range (nmap syntax: eg 1,2-10,11)')
 
     parser.add_argument("--endpoint", type=str,
                         default='/', help="Send an HTTP request to an endpoint (default: /)")
@@ -761,23 +883,22 @@ if __name__ == "__main__":
     parser.add_argument("--user-agent", dest='user_agent', type=str, default='random',
                         help='Set a custom user agent (default: randomly selected from popular well-known agents)')
 
-
     parser.add_argument("--allow-redirects", dest='allow_redirects', action='store_true')
-    parser.add_argument("--disallow-redirects", dest='allow_redirects', action='store_false')
 
     parser.add_argument("--method", type=str, default="GET",
                         help='Set HTTP request method type (default: GET, available methods: GET, POST, HEAD)')
 
-    parser.add_argument('--use-https', dest='sslcheck', action='store_true')
-    parser.add_argument('--no-use-https', dest='sslcheck', action='store_false')
+    parser.add_argument('--use-https', dest='sslcheck', action='store_true',
+                        help='Perform an HTTPS connection on the initial host')
 
     parser.add_argument('--list-payloads', nargs='*', dest='list_payloads',
                         help='list payloads(bytes stored in files): file1 file2 file2', required=False)
 
-    parser.add_argument('--show-statistics', dest='statistics', action='store_true')
-    parser.add_argument('--no-show-statistics', dest='statistics', action='store_false')
-
     parser.add_argument('--full-headers', dest='full_headers', type=str, default=None)
+
+    parser.add_argument('--show-statistics', dest='statistics', action='store_true')
+
+    parser.add_argument('--show-only-success', dest='show_only_success', action='store_true')
 
 
     path_to_file_targets = None # set default None to inputfile
@@ -796,6 +917,11 @@ if __name__ == "__main__":
             if not checkfile(path_to_file_targets):
                 print(f'ERROR: file not found: {path_to_file_targets}')
                 exit(1)
+
+        if not args.output_file:
+            output_file, mode_write = '/dev/stdout', 'wb'
+        else:
+            output_file, mode_write = args.output_file, 'a'
 
         if args.list_payloads and args.method != 'POST':
             print('Exit, method not POST, why payloads is needed ?')
@@ -839,6 +965,7 @@ if __name__ == "__main__":
     queue_results = asyncio.Queue()
 
     s = datetime.datetime.now()
+    resolver = aiodns.DNSResolver(loop=loop)
     producer_coro = method_create_targets(queue_results, settings, path_to_file_targets)
     consumer_coro = work_with_queue(queue_results, count_cor)
     loop.run_until_complete(asyncio.gather(producer_coro, consumer_coro))
